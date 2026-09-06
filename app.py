@@ -22,7 +22,7 @@
 а по Bluetooth Low Energy между устройствами, достаточно будет
 написать класс BLETripStore с теми же методами (add_trip,
 get_active_trips, accept_trip, start_passenger, finish_trip,
-get_trip_by_code) и подставить его вместо TripStore — код экранов
+get_trip) и подставить его вместо TripStore — код экранов
 трогать не придётся.
 
 В шапке приложения есть переключатель «Онлайн» / «Офлайн» — в обоих
@@ -36,7 +36,7 @@ get_trip_by_code) и подставить его вместо TripStore — ко
     просто как способ обновить мгновенно, не дожидаясь таймера.
 """
 
-import random
+import re
 import threading
 import uuid
 
@@ -47,6 +47,34 @@ import flet as ft
 # --------------------------------------------------------------------------
 
 DIRECTIONS = ["ГУК УрФУ → НВК", "НВК → ГУК УрФУ"]
+
+# ---- Валидация полей формы водителя --------------------------------------
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+PHONE_RE = re.compile(r"^(\+7|8|7)\d{10}$")
+TELEGRAM_RE = re.compile(r"^@[A-Za-z0-9_]{5,32}$")
+
+
+def validate_time(value: str) -> bool:
+    """Время в формате ЧЧ:ММ, например 9:00 или 18:30."""
+    return bool(TIME_RE.match((value or "").strip()))
+
+
+def validate_price(value: str) -> bool:
+    """Цена — положительное число (допускается дробное через точку/запятую)."""
+    text = (value or "").strip().replace(",", ".")
+    try:
+        price = float(text)
+    except ValueError:
+        return False
+    return price > 0
+
+
+def validate_contact(value: str) -> bool:
+    """Телефон (+7XXXXXXXXXX / 8XXXXXXXXXX) или телеграм-юзернейм (@name,
+    5-32 символа: латиница, цифры, подчёркивание)."""
+    text = (value or "").strip()
+    digits_only = re.sub(r"[\s\-()]", "", text)
+    return bool(PHONE_RE.match(digits_only) or TELEGRAM_RE.match(text))
 
 
 class TripStore:
@@ -65,16 +93,16 @@ class TripStore:
         with self._lock:
             self._trips.append(trip)
 
-    def accept_trip(self, code: str, passenger_name: str):
+    def accept_trip(self, trip_id: str, passenger_name: str):
         """Попутчик принимает поездку. Возвращает поездку либо None,
-        если мест не осталось или код не найден.
+        если мест не осталось или поездка не найдена.
 
         Каждый принявший попутчик получает свой уникальный id — по нему
         водитель потом сможет начать поездку именно для этого человека,
         даже если у нескольких попутчиков совпадают имена."""
         with self._lock:
             for trip in self._trips:
-                if trip["code"] == code and trip["seats_available"] > 0:
+                if trip["id"] == trip_id and trip["seats_available"] > 0:
                     trip["seats_available"] -= 1
                     trip["accepted"].append({
                         "id": uuid.uuid4().hex[:8],
@@ -83,14 +111,14 @@ class TripStore:
                     return dict(trip)
         return None
 
-    def start_passenger(self, code: str, passenger_id: str) -> bool:
+    def start_passenger(self, trip_id: str, passenger_id: str) -> bool:
         """Водитель начинает поездку для конкретного попутчика: тот
         убирается из списка ожидающих посадки. Если это был последний
         ожидающий попутчик, вся поездка считается начатой и её данные
         удаляются полностью. Возвращает True, если поездка была удалена."""
         with self._lock:
             for trip in self._trips:
-                if trip["code"] == code:
+                if trip["id"] == trip_id:
                     trip["accepted"] = [
                         p for p in trip["accepted"] if p["id"] != passenger_id
                     ]
@@ -100,39 +128,27 @@ class TripStore:
                     return False
         return False
 
-    def finish_trip(self, code: str) -> None:
+    def finish_trip(self, trip_id: str) -> None:
         """Полностью удаляет все данные о поездке (отмена поездки
         водителем)."""
         with self._lock:
-            self._trips[:] = [t for t in self._trips if t["code"] != code]
+            self._trips[:] = [t for t in self._trips if t["id"] != trip_id]
 
     # ---- чтение -------------------------------------------------------
     def get_active_trips(self):
         with self._lock:
             return [dict(t) for t in self._trips]
 
-    def get_trip_by_code(self, code: str):
+    def get_trip(self, trip_id: str):
         with self._lock:
             for trip in self._trips:
-                if trip["code"] == code:
+                if trip["id"] == trip_id:
                     return dict(trip)
         return None
-
-    def existing_codes(self):
-        with self._lock:
-            return {t["code"] for t in self._trips}
 
 
 store = TripStore()
 PUBSUB_TOPIC = "trips_updated"
-
-
-def generate_code(existing: set) -> str:
-    """Генерирует уникальный 3-значный код поездки (000-999)."""
-    while True:
-        code = f"{random.randint(0, 999):03d}"
-        if code not in existing:
-            return code
 
 
 # --------------------------------------------------------------------------
@@ -150,9 +166,9 @@ def main(page: ft.Page):
     # состояние текущей сессии (у каждого подключившегося браузера — своё)
     state = {
         "role": None, # "driver" | "passenger"
-        "trip_code": None, # код поездки, созданной этим водителем
+        "trip_id": None, # id поездки, созданной этим водителем
         "passenger_name": None,
-        "revealed_code": None, # код поездки, чей контакт уже раскрыт попутчику
+        "revealed_trip_id": None, # id поездки, чей контакт уже раскрыт попутчику
         "passenger_list_view": None, # активный ListView экрана списка поездок (если открыт)
         "online_mode": True, # вкл — автообновление по сети; выкл — только вручную (офлайн)
     }
@@ -209,8 +225,8 @@ def main(page: ft.Page):
     # ---------------- Экран выбора роли -------------------------------
     def show_role_selection(message: str | None = None):
         state["role"] = None
-        state["trip_code"] = None
-        state["revealed_code"] = None
+        state["trip_id"] = None
+        state["revealed_trip_id"] = None
         state["passenger_list_view"] = None
 
         controls = [
@@ -248,6 +264,7 @@ def main(page: ft.Page):
         state["role"] = "driver"
         state["passenger_list_view"] = None
 
+        driver_name_tf = ft.TextField(label="Ваше имя", width=300)
         direction_dd = ft.Dropdown(
             label="Направление",
             width=300,
@@ -255,12 +272,17 @@ def main(page: ft.Page):
             value=DIRECTIONS[0],
         )
         seats_tf = ft.TextField(label="Количество мест", width=300, keyboard_type=ft.KeyboardType.NUMBER)
-        time_tf = ft.TextField(label="Время отправления (напр. 18:30)", width=300)
+        time_tf = ft.TextField(label="Время отправления, например 18:30", width=300)
         price_tf = ft.TextField(label="Цена, ₽", width=300, keyboard_type=ft.KeyboardType.NUMBER)
-        contact_tf = ft.TextField(label="Контакт (телефон / телеграм)", width=300)
+        contact_tf = ft.TextField(label="Контакт: телефон +7... или телеграм @username", width=300)
         error_text = ft.Text("", color=ft.Colors.RED_600)
 
         def create_trip(e):
+            if not driver_name_tf.value or not driver_name_tf.value.strip():
+                error_text.value = "Введите ваше имя"
+                page.update()
+                return
+
             try:
                 seats = int(seats_tf.value)
                 if seats <= 0:
@@ -270,14 +292,27 @@ def main(page: ft.Page):
                 page.update()
                 return
 
-            if not time_tf.value or not price_tf.value.strip() or not contact_tf.value.strip():
-                error_text.value = "Заполните время, цену и контакт"
+            if not validate_time(time_tf.value):
+                error_text.value = "Время укажите в формате ЧЧ:ММ, например 18:30"
                 page.update()
                 return
 
-            code = generate_code(store.existing_codes())
+            if not validate_price(price_tf.value):
+                error_text.value = "Цена должна быть положительным числом"
+                page.update()
+                return
+
+            if not validate_contact(contact_tf.value):
+                error_text.value = (
+                    "Контакт: телефон вида +79001234567/89001234567 "
+                    "или телеграм-юзернейм вида @ivan_ivanov"
+                )
+                page.update()
+                return
+
             trip = {
-                "code": code,
+                "id": uuid.uuid4().hex,
+                "driver_name": driver_name_tf.value.strip(),
                 "direction": direction_dd.value,
                 "seats_total": seats,
                 "seats_available": seats,
@@ -287,7 +322,7 @@ def main(page: ft.Page):
                 "accepted": [],
             }
             store.add_trip(trip)
-            state["trip_code"] = code
+            state["trip_id"] = trip["id"]
             page.pubsub.send_all(PUBSUB_TOPIC)
             show_driver_waiting()
 
@@ -296,6 +331,7 @@ def main(page: ft.Page):
                 ft.IconButton(ft.Icons.ARROW_BACK, on_click=lambda e: show_role_selection()),
                 ft.Text("Создание поездки", size=20, weight=ft.FontWeight.BOLD),
             ]),
+            driver_name_tf,
             direction_dd,
             seats_tf,
             time_tf,
@@ -307,19 +343,19 @@ def main(page: ft.Page):
 
     # ---------------- Водитель: экран ожидания попутчиков ---------------
     def show_driver_waiting():
-        trip = store.get_trip_by_code(state["trip_code"])
+        trip = store.get_trip(state["trip_id"])
         if trip is None:
             show_role_selection("Поездка завершена")
             return
 
         def cancel_trip(e):
-            store.finish_trip(trip["code"])
+            store.finish_trip(trip["id"])
             page.pubsub.send_all(PUBSUB_TOPIC)
             show_role_selection("Поездка отменена")
 
         def make_start_handler(passenger_id, passenger_name):
             def handler(e):
-                trip_removed = store.start_passenger(trip["code"], passenger_id)
+                trip_removed = store.start_passenger(trip["id"], passenger_id)
                 page.pubsub.send_all(PUBSUB_TOPIC)
                 if trip_removed:
                     show_role_selection("Поездка начата. Хорошей дороги!")
@@ -358,7 +394,7 @@ def main(page: ft.Page):
             ft.Card(content=ft.Container(
                 padding=16,
                 content=ft.Column([
-                    ft.Text(f"Код поездки: {trip['code']}", size=24, weight=ft.FontWeight.BOLD),
+                    ft.Text(f"Водитель: {trip['driver_name']}", size=18, weight=ft.FontWeight.BOLD),
                     ft.Text(trip["direction"], size=16),
                     ft.Text(f"Время: {trip['time']}"),
                     ft.Text(f"Цена: {trip['price']} ₽"),
@@ -402,12 +438,12 @@ def main(page: ft.Page):
         full = trip["seats_available"] <= 0
 
         def accept(e):
-            result = store.accept_trip(trip["code"], state["passenger_name"])
+            result = store.accept_trip(trip["id"], state["passenger_name"])
             if result is None:
                 snack("Извините, места закончились")
                 refresh_passenger_cards()
                 return
-            state["revealed_code"] = trip["code"]
+            state["revealed_trip_id"] = trip["id"]
             page.pubsub.send_all(PUBSUB_TOPIC)
             show_passenger_contact(result)
 
@@ -415,7 +451,7 @@ def main(page: ft.Page):
             padding=16,
             content=ft.Column([
                 ft.Text(trip["direction"], size=16, weight=ft.FontWeight.BOLD),
-                ft.Text(f"Код: {trip['code']}"),
+                ft.Text(f"Водитель: {trip['driver_name']}"),
                 ft.Text(f"Время: {trip['time']}"),
                 ft.Text(f"Цена: {trip['price']} ₽"),
                 ft.Text(f"Свободно мест: {trip['seats_available']} из {trip['seats_total']}"),
@@ -445,7 +481,7 @@ def main(page: ft.Page):
 
     def show_passenger_list():
         state["role"] = "passenger"
-        state["revealed_code"] = None
+        state["revealed_trip_id"] = None
 
         list_view = ft.ListView(spacing=10, expand=True, auto_scroll=False)
         state["passenger_list_view"] = list_view
@@ -463,7 +499,7 @@ def main(page: ft.Page):
     # ---------------- Попутчик: контакт после принятия поездки -----------
     def show_passenger_contact(trip):
         # если водитель уже завершил/отменил поездку, пока попутчик смотрел контакт
-        fresh = store.get_trip_by_code(trip["code"])
+        fresh = store.get_trip(trip["id"])
         if fresh is None:
             show_role_selection("Поездка была завершена или отменена водителем")
             return
@@ -474,9 +510,9 @@ def main(page: ft.Page):
                 padding=16,
                 content=ft.Column([
                     ft.Text(trip["direction"], size=16),
+                    ft.Text(f"Водитель: {trip['driver_name']}"),
                     ft.Text(f"Время: {trip['time']}"),
                     ft.Text(f"Цена: {trip['price']} ₽"),
-                    ft.Text(f"Код поездки: {trip['code']}"),
                     ft.Divider(),
                     ft.Text("Контакт водителя:", weight=ft.FontWeight.BOLD),
                     ft.Text(trip["contact"], size=18, selectable=True),
@@ -493,11 +529,11 @@ def main(page: ft.Page):
         по пуш-уведомлению (онлайн, через pubsub), и периодически по таймеру
         (офлайн, локальный опрос без сети) — поэтому вручную нажимать
         «Обновить» больше не нужно ни в одном из режимов."""
-        if state["role"] == "driver" and state["trip_code"]:
+        if state["role"] == "driver" and state["trip_id"]:
             show_driver_waiting()
         elif state["role"] == "passenger":
-            if state["revealed_code"]:
-                fresh = store.get_trip_by_code(state["revealed_code"])
+            if state["revealed_trip_id"]:
+                fresh = store.get_trip(state["revealed_trip_id"])
                 if fresh is None:
                     show_role_selection("Поездка была завершена или отменена водителем")
                 # если поездка ещё жива — просто оставляем экран контакта как есть
@@ -545,4 +581,3 @@ if __name__ == "__main__":
     # Несколько человек в одной сети могут одновременно открыть этот
     # адрес каждый со своего устройства (водитель и попутчики).
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=8550)
-
