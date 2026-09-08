@@ -1,0 +1,16 @@
+
+[project]
+name = "poputchiki"
+version = "0.1.0"
+description = "Поиск попутчиков ГУК УрФУ <-> НВК"
+requires-python = ">=3.9"
+dependencies = [
+    "flet",
+]
+
+[tool.flet]
+org = "com.example" # смените на своё, например com.urfu
+product = "Попутчики УрФУ"
+
+[tool.flet.app]
+path = "src"
