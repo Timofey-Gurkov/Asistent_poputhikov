@@ -1,6 +1,6 @@
 {
-    "name": "Попутчики УрФУ",
-    "short_name": "poputchiki",
+    "name": "src",
+    "short_name": "src",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#FFFFFF",
